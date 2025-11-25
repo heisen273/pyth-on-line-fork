@@ -15,6 +15,7 @@ from types import ModuleType, TracebackType
 from typing import Any, Self
 from weakref import WeakValueDictionary
 
+from reactivity.hmr.hooks import pre_reload
 from . import post_reload
 from .. import derived_method
 from ..context import Context
@@ -23,6 +24,13 @@ from ._common import HMR_CONTEXT
 from .fs import add_filter, notify, setup_fs_audithook
 from .hooks import call_post_reload_hooks, call_pre_reload_hooks
 from .proxy import Proxy
+
+
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# )
+# logger = logging.getLogger("hmr.debug")
 
 
 def is_called_internally(*, extra_depth=0) -> bool:
@@ -95,6 +103,8 @@ class ReactiveModule(ModuleType):
             file = self.__file
             # logger.info(f"  Reading file: {file}")
             file_text = file.read_text("utf-8")
+
+            # Pytest: avoid exiting the whole process when pytest.main() is called. Instead, just run the main function.
             if "pytest.console_main()" in file_text:
                 file_text = file_text.replace("raise SystemExit(pytest.console_main())", "pytest.console_main()")
 
@@ -350,47 +360,6 @@ class SyncReloader(BaseReloader):
         with suppress(KeyboardInterrupt), HMR_CONTEXT.effect(self.run_entry_file):
             call_post_reload_hooks()
             self.start_watching()
-
-
-# class AsyncReloader(BaseReloader):
-#     async def start_watching(self):
-#         from watchfiles import awatch
-#
-#         async for events in awatch(self.entry, *self.includes, stop_event=self._stop_event):  # type: ignore
-#             self.on_events(events)
-#
-#         del self._stop_event
-#
-#     async def keep_watching_until_interrupt(self):
-#         call_pre_reload_hooks()
-#         with suppress(KeyboardInterrupt), HMR_CONTEXT.effect(self.run_entry_file):
-#             call_post_reload_hooks()
-#             await self.start_watching()
-
-
-import logging
-#
-# logging.basicConfig(
-#     level=logging.DEBUG,
-#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-# )
-# logger = logging.getLogger("hmr.debug")
-
-from reactivity.hmr.hooks import pre_reload
-
-import logging
-import sys
-from pathlib import Path
-
-import asyncio
-import ctypes
-import logging
-import threading
-from contextlib import suppress
-import signal
-
-
-# logger = logging.getLogger("hmr.debug")
 
 
 @pre_reload
