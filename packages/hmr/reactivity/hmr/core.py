@@ -15,6 +15,8 @@ from types import ModuleType, TracebackType
 from typing import Any, Self
 from weakref import WeakValueDictionary
 
+from reactivity.hmr.hooks import pre_reload
+from . import post_reload
 from .. import derived_method
 from ..context import Context
 from ..primitives import BaseDerived, Derived, Signal
@@ -22,6 +24,13 @@ from ._common import HMR_CONTEXT
 from .fs import add_filter, notify, remove_filter, setup_fs_audithook
 from .hooks import call_post_reload_hooks, call_pre_reload_hooks
 from .proxy import Proxy
+
+
+# logging.basicConfig(
+#     level=logging.DEBUG,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# )
+# logger = logging.getLogger("hmr.debug")
 
 
 def is_called_internally(*, extra_depth=0) -> bool:
@@ -92,7 +101,14 @@ class ReactiveModule(ModuleType):
     def __load(self):
         try:
             file = self.__file
-            ast = parse(file.read_text("utf-8"), str(file))
+            # logger.info(f"  Reading file: {file}")
+            file_text = file.read_text("utf-8")
+
+            # Pytest: avoid exiting the whole process when pytest.main() is called. Instead, just run the main function.
+            if "pytest.console_main()" in file_text:
+                file_text = file_text.replace("raise SystemExit(pytest.console_main())", "pytest.console_main()")
+
+            ast = parse(file_text, str(file))
             code = compile(ast, str(file), "exec", dont_inherit=True)
             self.__flags = code.co_flags
         except SyntaxError as e:
@@ -318,6 +334,8 @@ class BaseReloader:
                 else:
                     notify(path)
 
+        self.entry_module.load.invalidate()
+
         call_post_reload_hooks()
 
     @cached_property
@@ -355,20 +373,165 @@ class SyncReloader(BaseReloader):
             self.start_watching()
 
 
+@pre_reload
+def clear_pytest_cache():
+    """Clear pytest cache between reloads"""
+    import importlib
+    import gc
+
+    pytest_modules = [
+        k for k in list(sys.modules.keys())
+        if k.startswith('_pytest')
+        or k.startswith('test_') or '.test_' in k or k.endswith('_test')
+        or k == "anyio"
+        or k == "pytest_asyncio"
+    ]
+
+    # logger.info(f"Clearing {len(pytest_modules)} pytest modules")
+
+    for mod in pytest_modules:
+        try:
+            del sys.modules[mod]
+        except KeyError:
+            pass
+
+    gc.collect()
+    importlib.invalidate_caches()
+
+
+import asyncio
+import ctypes
+import logging
+import threading
+from contextlib import suppress
+from pathlib import Path
+
+logger = logging.getLogger("hmr.debug")
+
+
 class AsyncReloader(BaseReloader):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._execution_thread = None
+        self._run_count = 0
+
+    def _kill_thread(self):
+        """Kill execution thread and wait for it to die"""
+        if not self._execution_thread:
+            logger.info("No execution thread to kill")
+            return
+
+        if not self._execution_thread.is_alive():
+            logger.info("Execution thread already dead")
+            return
+
+        thread_id = self._execution_thread.ident
+        logger.info(f"⚠️  Interrupting thread {thread_id}...")
+
+        try:
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(thread_id),
+                ctypes.py_object(SystemExit)
+            )
+
+            if res > 0:
+                self._execution_thread.join(timeout=2.0)
+                if self._execution_thread.is_alive():
+                    logger.warning("⚠️  Thread still alive after 2s")
+                else:
+                    logger.info("✓ Thread killed successfully")
+        except Exception as e:
+            logger.error(f"Kill failed: {e}")
+
+    def _run_tests(self):
+        """Run tests in current thread"""
+        self._run_count += 1
+        logger.info(f"\n{'#'*80}")
+        logger.info(f"▶️  EXECUTION #{self._run_count}")
+        logger.info(f"{'#'*80}\n")
+
+        try:
+            self.run_entry_file()
+            logger.info("✅ Completed")
+        except KeyboardInterrupt:
+            logger.info("⏹️  Interrupted")
+        except SystemExit:
+            pass
+        except Exception as e:
+            logger.error(f"❌ Error: {e}")
+
+    def on_changes(self, files: set):
+        """Override to prevent notify() from triggering effect"""
+        from .core import get_path_module_map
+        from .hooks import call_pre_reload_hooks
+
+        path2module = get_path_module_map()
+        call_pre_reload_hooks()
+
+        # Only invalidate, don't notify!
+        # notify() would trigger the effect synchronously
+        with self.error_filter, HMR_CONTEXT.batch():
+            for path in files:
+                if module := path2module.get(path):
+                    logger.info(f"Invalidating module: {path.name}")
+                    module.load.invalidate()
+                else:
+                    # DON'T call notify(path) - that would trigger the effect!
+                    # Just invalidate the entry module
+                    logger.info(f"File changed: {path.name}")
+
+            # Invalidate entry module so it reloads on next run
+            logger.info("Invalidating entry module")
+            self.entry_module.load.invalidate()
+
     async def start_watching(self):
         from watchfiles import awatch
 
-        async for events in awatch(self.entry, *self.includes, stop_event=self._stop_event):  # type: ignore
-            self.on_events(events)
+        async for events in awatch(self.entry, *self.includes, stop_event=self._stop_event):
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🔄 FILE CHANGE!")
+            logger.info(f"{'='*80}")
+
+            # Kill current execution
+            self._kill_thread()
+
+            # Process changes (invalidate only, no notify)
+            files = {Path(file).resolve() for _, file in events}
+            self.on_changes(files)
+
+            # Start new execution immediately
+            logger.info("🚀 Starting new execution...")
+            self._execution_thread = threading.Thread(
+                target=self._run_tests,
+                daemon=True
+            )
+            self._execution_thread.start()
 
         del self._stop_event
 
     async def keep_watching_until_interrupt(self):
+        from .hooks import call_pre_reload_hooks, call_post_reload_hooks
+
         call_pre_reload_hooks()
-        with suppress(KeyboardInterrupt), HMR_CONTEXT.effect(self.run_entry_file):
-            call_post_reload_hooks()
+
+        # NO effect! We don't want the effect system involved at all
+        # The file tracking happens naturally when run_entry_file executes
+        call_post_reload_hooks()
+
+        # Start initial execution
+        logger.info("🚀 Starting initial execution...")
+        self._execution_thread = threading.Thread(
+            target=self._run_tests,
+            daemon=True
+        )
+        self._execution_thread.start()
+
+        # Start watching
+        try:
             await self.start_watching()
+        except KeyboardInterrupt:
+            logger.info("\n👋 Stopping...")
+            self._kill_thread()
 
 
 __version__ = "0.7.6.2"
